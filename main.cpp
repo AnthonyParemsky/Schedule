@@ -1,0 +1,1461 @@
+#include "raylib.h"
+#include <string>
+#include <stdint.h>
+#include <stdio.h>
+#include <vector>
+#include <cstring>
+
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
+typedef int8_t s8;
+typedef int16_t s16;
+typedef int32_t s32;
+typedef int64_t s64;
+typedef uint8_t bool8;
+
+//NOTE: SVN TEST
+
+//TODO: add indicator for schedule being fully cleared (no tasks, even checked boxes)
+//TODO: have timer work while tab not open, send notification to timer when finished
+
+//NOTE: for windows keyboard input
+typedef void *HKL;
+
+struct FILETIME
+{
+    u32 dwLowDateTime;
+    u32 dwHighDateTime;
+};
+
+struct SYSTEMTIME
+{
+    u16 year;
+    u16 month;
+    u16 day_of_week;
+    u16 day;
+    u16 hour;
+    u16 minute;
+    u16 second;
+    u16 millisecond;
+};
+
+struct SIDE_BAR_TIME
+{
+    Rectangle time;
+    Rectangle date;
+    Rectangle notifications;
+};
+
+struct BUTTON
+{
+    Rectangle button;
+    char str[25] = {};
+    Rectangle str_rec;
+};
+
+struct SIDE_BAR_BUTTONS
+{
+    BUTTON schedule;
+    BUTTON timer;
+    BUTTON hour_tracker;
+    BUTTON flashcards;
+    // NOTE(anton): last two on same row, special handling
+    char sync_str[25] = "sync";
+    Rectangle sync;
+    Rectangle settings;
+    Rectangle sync_rec;
+    Rectangle settings_str_rec;
+    s32 size = 5;
+};
+
+struct FONTS_INFORMATION
+{
+    Font font_mega;
+    Font font_large;
+    Font font_med;
+    Font font_small;
+    int font_size_mega;
+    int font_size_large;
+    int font_size_med;
+    int font_size_small;
+    int font_spacing = 0;
+};
+
+struct schedule_subcat
+{
+    // NOTE: task max str len ~14?
+    int header_max_char = 8;
+    int task_max_char = 20;
+    u8 task_count = 0;
+    // NOTE: header max str len ~8?
+    char header[9] = {0};
+    // NOTE: max 5 tasks
+    char tasks[5][21] = {0};
+    // NOTE: set bits to show completion, least sig bit is first task, shift left for others
+    // ex: 0000 1010 means 2nd and 4th task complete
+    char task_comp = 0;
+};
+
+struct schedule_day
+{
+    schedule_subcat subcat[6];
+    //NOTE: 0 = monday,6 = sunday, 7 = extra
+    s16 day = 0;
+    //NOTE: max 6
+    u8 subcat_count = 0;
+    // NOTE: header that is currently being editted
+    // -1 if none
+    s8 edit_header = -1;
+    // NOTE: task currently being editted
+    // -1 if none
+    s8 edit_task = -1;
+    u8 add_mode = 0;
+};
+
+struct TIMER_INFO
+{
+    //NOTE: start of timer, in milliseconds, obtained from GetTickCount64()
+    u64 timer_start = 0;
+    u64 timer_length = 0;
+    //NOTE: value used only for timer to keep track of the initial value counting down from
+    u64 timer_total = 0;
+    //NOTE: timer_mode, least sig bit on/off signals timer/stopwatch
+    //second least sig signals looking at tasks vs not
+    //third least sig signals timer started vs not
+    u8 timer_mode = 0;
+    s8 task_index = -1;
+    //NOTE: current unit being added, 0 = sec, 1 = min, 2 = hour
+    u8 add_mode = 0;
+};
+
+struct task_hour_track
+{
+    char task[17] = {};
+    u32 second_count = 0;
+    Color task_color = BLACK;
+};
+
+extern "C"
+{
+    void GetSystemTime(SYSTEMTIME *out);
+    void GetLocalTime(SYSTEMTIME *out);
+    s32 ToUnicodeEx(u32 wVirtKey, u32 wScanCode, const u8 *lpKeyState, u16 *pwszBuff,
+            s32 cchBuff, u32 wFlags, HKL dwhkl);
+    u64 GetTickCount64();
+}
+
+// NOTE(anton): write_count to start_index, write the number, put 0s
+// once the number ends to pad
+// NOTE(anton): might break on negative numbers
+void u16_to_str(u16 input,char * output,u8 write_count,u8 start_index)
+{
+    // NOTE(anton): index
+    int i = start_index + write_count - 1;
+
+    int num = 0;
+    for(;start_index <= i;--i)
+    {
+        num = input % 10;
+        output[i] = '0' + num;
+        input /= 10;
+    }
+}
+
+void u32_to_str_hex(u32 input,char * output,u8 write_count,u8 start_index)
+{
+    // NOTE(anton): index
+    int i = start_index + write_count - 1;
+
+    int num = 0;
+    for(;start_index <= i;--i)
+    {
+        num = input % 16;
+        if(num >= 0 && num <= 9)
+        {
+            output[i] = '0' + num;
+        }
+        else
+        {
+            num %= 10;
+            output[i] = 'a' + num;
+        }
+        input /= 16;
+    }
+}
+
+// TODO: test text size, don't add char if it goes above
+void append_char(char* str,char new_char,int max_len,float max_width,
+        Font font,float font_size, float font_spacing)
+{
+    //NOTE: max_len doesn't include null char at tend
+    //NOTE: backspace
+    if(new_char == 8)
+    {
+        for(int i = 0;i < max_len + 1;++i)
+        {
+            if(str[i] == 0)
+            {
+                if(i - 1 >= 0)
+                {
+                    str[i-1] = 0;
+                }
+                break;
+            }
+        }
+    }
+    else
+    {
+        for(int i = 0;i < max_len;++i)
+        {
+            if(str[i] == 0)
+            {
+                str[i] = new_char;
+                str[i+1] = 0;
+                Vector2 text_size = MeasureTextEx(font,str,font_size,font_spacing);
+                if(text_size.x >= max_width)
+                {
+                    str[i] = 0;
+                }
+                break;
+            }
+        }
+    }
+}
+
+Rectangle centre_text(Font font, char const* text, int font_size, float spacing, Rectangle *contain_box)
+{
+    // TODO: lower the centre
+    Vector2 v2 = MeasureTextEx(font,text,font_size,spacing);
+    Rectangle ret_rec;
+    ret_rec.width = v2.x;
+    ret_rec.height = v2.y;
+    ret_rec.x = contain_box->x + ((contain_box->width - ret_rec.width)/2);
+    ret_rec.y = contain_box->y + ((contain_box->height - ret_rec.height)/2) + font_size/10;
+    return ret_rec;
+}
+
+// NOTE(anton): set time section element's sizes
+// time_section contains the section's size
+void update_time_section(SIDE_BAR_TIME *side_bar_time, Rectangle time_section, FONTS_INFORMATION *font_info,
+        char *time, char* date)
+{
+    Vector2 temp_vec;
+    // NOTE(anton): Update time
+    temp_vec = MeasureTextEx(font_info->font_large, time, font_info->font_size_large,
+            font_info->font_spacing);
+    side_bar_time->time.width = temp_vec.x;
+    side_bar_time->time.height = temp_vec.y;
+    side_bar_time->time.x = time_section.x + ((time_section.width - side_bar_time->time.width) / 2);
+    side_bar_time->time.y = (time_section.height - font_info->font_size_large) / 2;
+
+    temp_vec = MeasureTextEx(font_info->font_small, date, font_info->font_size_small,
+            font_info->font_spacing);
+    side_bar_time->date.width = temp_vec.x;
+    side_bar_time->date.height = temp_vec.y;
+    side_bar_time->date.x = time_section.x + time_section.width - side_bar_time->date.width
+        - time_section.width/100;
+    side_bar_time->date.y = time_section.height / 100;
+
+    temp_vec = MeasureTextEx(font_info->font_small, " ! ", font_info->font_size_small,
+            font_info->font_spacing);
+    side_bar_time->notifications.width = temp_vec.x;
+    side_bar_time->notifications.height = temp_vec.y;
+    side_bar_time->notifications.x = time_section.x+font_info->font_size_small;
+    side_bar_time->notifications.y = time_section.height / 100;
+}
+
+void update_button_section(SIDE_BAR_BUTTONS *side_bar_buttons, Rectangle button_section,
+        FONTS_INFORMATION *font_info)
+{
+    int button_count = side_bar_buttons->size;
+    int button_gap = button_section.height / 50;
+    int button_width = button_section.width - (button_gap*2);
+    int button_height = (button_section.height - ((button_count + 1)*button_gap)) / button_count;
+    int start_x = button_section.x + button_gap;
+    int start_y = button_section.y + button_gap;
+    Rectangle current_button = {(float)start_x, (float)start_y, (float)button_width, (float)button_height};
+
+    side_bar_buttons->schedule.button = current_button;
+    side_bar_buttons->schedule.str_rec = centre_text(font_info->font_med,side_bar_buttons->schedule.str,
+            font_info->font_size_med, font_info->font_spacing, &current_button);
+    current_button.y += button_gap + current_button.height;
+
+    side_bar_buttons->timer.button = current_button;
+    side_bar_buttons->timer.str_rec = centre_text(font_info->font_med,side_bar_buttons->timer.str,
+            font_info->font_size_med, font_info->font_spacing, &current_button);
+    current_button.y += button_gap + current_button.height;
+
+    side_bar_buttons->hour_tracker.button = current_button;
+    side_bar_buttons->hour_tracker.str_rec = centre_text(font_info->font_med,side_bar_buttons->hour_tracker.str,
+            font_info->font_size_med, font_info->font_spacing, &current_button);
+    current_button.y += button_gap + current_button.height;
+
+    side_bar_buttons->flashcards.button = current_button;
+    side_bar_buttons->flashcards.str_rec = centre_text(font_info->font_med,side_bar_buttons->flashcards.str,
+            font_info->font_size_med, font_info->font_spacing, &current_button);
+    current_button.y += button_gap + current_button.height;
+    
+    // NOTE(anton): last two on same row, special handling, need to change if add buttons
+    side_bar_buttons->sync = current_button;
+    side_bar_buttons->sync.width -= button_height + button_gap;
+    side_bar_buttons->sync_rec = centre_text(font_info->font_med,side_bar_buttons->sync_str,
+            font_info->font_size_med, font_info->font_spacing, &side_bar_buttons->sync);
+    side_bar_buttons->settings.x = side_bar_buttons->sync.x + side_bar_buttons->sync.width + button_gap;
+    side_bar_buttons->settings.y = current_button.y;
+    side_bar_buttons->settings.height = button_height;
+    side_bar_buttons->settings.width = button_height;
+    side_bar_buttons->settings_str_rec = centre_text(font_info->font_med,"O",
+            font_info->font_size_med, font_info->font_spacing, &side_bar_buttons->settings);
+}
+
+bool8 v_in_rec(Vector2 v, Rectangle rec)
+{
+    return (v.x >= rec.x) && (v.x <= (rec.x + rec.width))
+        && (v.y >= rec.y) && (v.y <= (rec.y + rec.height));
+}
+
+// NOTE: expects square
+void render_plus(Rectangle rec,Color col)
+{
+    u16 width_div = 16;
+    Rectangle rec_hor = {rec.x+rec.width*2/(width_div),rec.y+(rec.height/2)-(rec.height/width_div),
+        rec.width-rec.width/(width_div/4),rec.height/(width_div/2)};
+    Rectangle rec_vert = {rec.x+(rec.width/2)-(rec.width/width_div),rec.y+rec.height*2/(width_div),
+        rec.width/(width_div/2),rec.height-rec.width/(width_div/4)};
+    DrawRectangleRec(rec_hor,col);
+    DrawRectangleRec(rec_vert,col);
+}
+
+// NOTE(anton): render four corners
+void render_button(Rectangle rec)
+{
+    // NOTE(anton): x,y,width, height
+    Rectangle rec1 = {rec.x,rec.y+(rec.height/3),rec.width,rec.height/3};
+    Rectangle rec2 = {rec.x+rec1.height,rec.y,rec.width-(rec1.height*2),rec.height};
+    DrawRectangleLinesEx(rec,rec.height/25,BLACK);
+    DrawRectangleRec(rec1,WHITE);
+    DrawRectangleRec(rec2,WHITE);
+}
+
+void render_rec_black(Rectangle rec)
+{
+    DrawRectangleLinesEx(rec,rec.height/16,BLACK);
+}
+
+void RenderHoveredRec(Rectangle rec)
+{
+    DrawRectangleRec(rec,{205,209,228,255});
+}
+
+int render_if_hovered(Vector2 mouse, Rectangle button,void (*render_func)(Rectangle))
+{
+    if(v_in_rec(mouse,button))
+    {
+        render_func(button);
+        return 1;
+    }
+    return 0;
+}
+
+void render_schedule_box(Rectangle schedule_box)
+{
+    float line_width = schedule_box.width/32;
+    DrawRectangleLinesEx(schedule_box,line_width,SKYBLUE);
+}
+
+
+//NOTE: KEY_ENTER logic handled outside of this function
+void write_text(float x, float y, float plus_rec_size,float box_width,char* str,int max_char,
+        Font font,float font_size,float font_spacing)
+{
+    int curr_key_pressed;
+    DrawRectangleLinesEx({x,y,box_width,plus_rec_size},plus_rec_size/16,BLACK);
+    //u32_to_str_hex(u32 input,char * output,u8 write_count,u8 start_index)
+    //TODO: loop until return val is 0, for multiple key presses
+    while(curr_key_pressed = GetCharPressed())
+    {
+        append_char(str, (char)curr_key_pressed, max_char,
+                box_width - plus_rec_size/8,font,font_size,
+                font_spacing);
+    }
+    DrawTextEx(font,str,
+            {x+plus_rec_size/8,y+plus_rec_size/4},
+            font_size,font_spacing,BLACK);
+    if(IsKeyPressed(KEY_BACKSPACE))
+    {
+            append_char(str,8,max_char,
+                box_width - plus_rec_size/8,font,font_size,
+                font_spacing);
+    }
+    if(IsKeyPressedRepeat(KEY_BACKSPACE))
+    {
+            append_char(str,8,max_char,
+                box_width - plus_rec_size/8,font,font_size,
+                font_spacing);
+    }
+}
+
+void clear_str(char* str, int str_len)
+{
+    for(int i = 0;i < str_len;++i)
+    {
+        str[i] = 0;
+    }
+}
+
+void copy_str(char* str_start,char* dest, int str_len)
+{
+    for(int i = 0;i < str_len;++i)
+    {
+        dest[i] = str_start[i];
+    }
+}
+
+void RemoveHeader(schedule_subcat* array,int index_to_pop,int array_size)
+{
+    int i = index_to_pop;
+    for(;i < array_size - 1;i++)
+    {
+        array[i] = array[i+1];
+    }
+    array[i] = schedule_subcat();
+}
+
+void ChangeEdit(schedule_day* days,int header_index,int task_index,int* schedule_mode)
+{
+    if(days[*schedule_mode - 1].edit_task == 
+            days[*schedule_mode - 1].subcat[days[*schedule_mode - 1].edit_header].task_count)
+    {
+        clear_str(days[*schedule_mode - 1].subcat[days[*schedule_mode - 1].edit_header].tasks[
+        days[*schedule_mode - 1].subcat[days[*schedule_mode - 1].edit_header].task_count],
+            days[*schedule_mode - 1].subcat[days[*schedule_mode - 1].edit_header].task_max_char + 1);
+    }
+    else if(days[*schedule_mode - 1].edit_header == 
+            days[*schedule_mode - 1].subcat_count)
+    {
+        clear_str(days[*schedule_mode - 1].subcat[days[*schedule_mode - 1].
+                subcat_count].header,
+            days[*schedule_mode - 1].subcat[days[*schedule_mode - 1].subcat_count].header_max_char + 1);
+    }
+    days[*schedule_mode - 1].edit_header = header_index;
+    days[*schedule_mode - 1].edit_task = task_index;
+}
+
+// TODO(anton): setting to change start day?
+// TODO(anton): way to add and check tasks as complete
+// TODO(anton): way to indicate that not all tasks are being shown in small square
+// (indicate need to click square to expand) ...(4 more tasks)
+// TODO(anton): subcategories? like under monday, cse 380, then tasks <- maybe as a setting, or add category?
+// TODO: on small view, have "5 tasks..."
+// TODO: fix backspace editing two boxes
+/*
+struct FONTS_INFORMATION
+{
+    Font font_large;
+    Font font_med;
+    Font font_small;
+    int font_size_large;
+    int font_size_med;
+    int font_size_small;
+    int font_spacing = 0;
+};
+   */
+void render_schedule(Rectangle function_section, FONTS_INFORMATION *font_info, Vector2 mouse,int* schedule_mode,
+        u16 day_of_week,schedule_day* days)
+{
+    // TODO: multi-lingual support
+    /*
+    const char* headers[8] = {"Monday", "Tuesday", "Wednesday", "Thursday",
+                      "Friday", "Saturday", "Sunday", "Extra"};
+                      */
+    const char* headers[8] = {"Mon", "Tue", "Wed", "Thu",
+                      "Fri", "Sat", "Sun", "Extra"};
+    // TODO: better colors (pastel?)
+    Color colors[8] = {GRAY,RED,BLUE,GREEN,GOLD,BROWN,YELLOW,BEIGE};
+    // NOTE: for both top and bottom row
+    int curr_index = 0;
+    const char* curr_header = 0;
+    Color curr_color = BLACK;
+    Rectangle header_text_rec;
+    int hovered = 0;
+    day_of_week = (day_of_week - 1) % 7;
+    // NOTE: default rendering
+    u32 plus_rec_size_u32 = 1;
+    while((plus_rec_size_u32 = plus_rec_size_u32 << 1) < font_info->font_size_small);
+    float plus_rec_size_inner = plus_rec_size_u32;
+    while((plus_rec_size_u32 = plus_rec_size_u32 << 1) < font_info->font_size_med);
+    float plus_rec_size = plus_rec_size_u32;
+    u32 curr_key_pressed;
+    if(*schedule_mode == 0)
+    {
+        Rectangle curr_box = {0,0,function_section.width/4,function_section.height/2};
+        float outer_line_width = curr_box.width/32;
+        Rectangle inner_box = {outer_line_width,outer_line_width,
+                               curr_box.width - outer_line_width*2,curr_box.height - outer_line_width*2};
+        Rectangle header_box = {inner_box.x + outer_line_width*2,inner_box.y + outer_line_width*2,
+            inner_box.width - outer_line_width*4,inner_box.height/5};
+        for(int i = 0;i < 2;i++)
+        {
+            for(int j = 0;j < 4;j++)
+            {
+                curr_header = headers[curr_index];
+                curr_color = colors[curr_index];
+                header_text_rec = centre_text(font_info->font_med,curr_header,font_info->font_size_med,
+                        font_info->font_spacing,&header_box);
+                DrawTextEx(font_info->font_med,curr_header,{header_text_rec.x,header_text_rec.y -
+                        outer_line_width}, font_info->font_size_med, font_info->font_spacing,BLACK);
+                Vector2 subcat_place = {header_box.x-outer_line_width,
+                    header_box.y+font_info->font_size_med+outer_line_width*2};
+                for(int k = 0;k < days[curr_index].subcat_count;++k)
+                {
+                    int curr_task_count = 0;
+                    for(int flag_index = 0;flag_index < days[curr_index].subcat[k].task_count;flag_index++)
+                    {
+                        if(!(days[curr_index].subcat[k].task_comp & (1 << flag_index)))
+                        {
+                            curr_task_count += 1;
+                        }
+                    }
+                    if(curr_task_count == 0)
+                    {
+                        DrawTextEx(font_info->font_med,days[curr_index].subcat[k].header,
+                                    {subcat_place.x,subcat_place.y},
+                            font_info->font_size_med,font_info->font_spacing,LIGHTGRAY);
+                        //NOTE: alt, SKYBLUE
+                    }
+                    else
+                    {
+                        DrawTextEx(font_info->font_med,days[curr_index].subcat[k].header,
+                                    {subcat_place.x,subcat_place.y},
+                            font_info->font_size_med,font_info->font_spacing,BLACK);
+                        //NOTE: alt, {255,166,102,255}
+                    }
+                    subcat_place.y += font_info->font_size_med+outer_line_width/8;
+                }
+                if(day_of_week == curr_index)
+                {
+                    DrawRectangleLinesEx(inner_box,outer_line_width*3/4,BLACK);
+                }
+                //DrawRectangleLinesEx(inner_box,outer_line_width*2,curr_color);
+                //NOTE: can use this, switch with other header_box render
+                /*
+                DrawRectangle(header_box.x,header_box.y+header_box.height,header_box.width,
+                        outer_line_width*1,curr_color);
+                        */
+                /*
+                DrawRectangleLinesEx(header_box,
+                        outer_line_width*1,curr_color);
+                        */
+                if(!hovered)
+                {
+                    hovered = render_if_hovered(mouse,curr_box,render_schedule_box);
+                    if(hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                    {
+                        *schedule_mode = curr_index + 1;
+                    }
+                }
+
+                curr_box.x += curr_box.width;
+                inner_box.x += curr_box.width;
+                header_box.x += curr_box.width;
+                curr_index += 1;
+            }
+            inner_box.x -= curr_box.width*4;
+            inner_box.y += curr_box.height;
+            header_box.x -= curr_box.width*4;
+            header_box.y += curr_box.height;
+            curr_box.x = 0;
+            curr_box.y += curr_box.height;
+        }
+    }
+    // NOTE: rendering if showing specifics of a box
+    else
+    {
+        if(IsKeyPressed(KEY_ESCAPE) && days[*schedule_mode - 1].edit_header == -1 &&
+                days[*schedule_mode - 1].edit_task == -1)
+        {
+            *schedule_mode = 0;
+        }
+        Rectangle curr_box = {0,0,function_section.width/4,function_section.height/4};
+        float outer_line_width = curr_box.width/32;
+        Rectangle inner_box = {outer_line_width,outer_line_width,
+                               curr_box.width - outer_line_width*2,curr_box.height - outer_line_width*2};
+        //Rectangle header_box = {inner_box.x + outer_line_width*2,inner_box.y + outer_line_width*2,
+            //inner_box.width - outer_line_width*4,inner_box.height/5};
+        Rectangle header_box = {inner_box.x + outer_line_width,inner_box.y + outer_line_width,
+            inner_box.width - outer_line_width*2,inner_box.height/5};
+        Rectangle main_box = {curr_box.width,0,curr_box.width*2,function_section.height};
+        DrawRectangleLinesEx(main_box,outer_line_width,BLACK);
+        //char const* ex_text = "Example";
+        //NOTE: big box
+        float x = main_box.x + outer_line_width*2;
+        float inner_x = x + outer_line_width*4;
+        float inner_y;
+        Vector2 plus_size;
+        u16 header_index = 0;
+        for(int k = 0;(k < 2);k++)
+        {
+            float y = main_box.y + outer_line_width*2;
+            for(int i = 0;(i < 3);i++)
+            {
+                if(days[*schedule_mode - 1].subcat_count == header_index)
+                {
+                    if(days[*schedule_mode - 1].edit_header == header_index &&
+                            days[*schedule_mode - 1].edit_task == -1)
+                    {
+
+                        write_text(x,y,plus_rec_size,plus_rec_size*7/2,
+                                days[*schedule_mode - 1].subcat[header_index].header,
+                                days[*schedule_mode - 1].subcat[header_index].header_max_char,
+                                font_info->font_med,font_info->font_size_med,
+                                font_info->font_spacing);
+                        if(IsKeyPressed(KEY_ENTER))
+                        {
+                            days[*schedule_mode - 1].subcat_count += 1;
+                            days[*schedule_mode - 1].edit_header = -1;
+                        }
+                        if(IsKeyPressed(KEY_DELETE) || IsKeyPressed(KEY_ESCAPE))
+                        {
+                            clear_str(days[*schedule_mode - 1].subcat[header_index].header,
+                                days[*schedule_mode - 1].subcat[header_index].header_max_char + 1);
+                            days[*schedule_mode - 1].edit_header = -1;
+                        }
+                    }
+                    else 
+                    {
+                        if(render_if_hovered(mouse,
+                                    {x,y,plus_rec_size,plus_rec_size}, render_button) &&
+                                    IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                        {
+                            //void ChangeEdit(schedule_day* days,header_index,task_index)
+                            ChangeEdit(days,header_index,-1,schedule_mode);
+                        }
+                        render_plus({x,y,plus_rec_size,plus_rec_size},SKYBLUE);
+                    }
+                }
+                else
+                {
+                    if(render_if_hovered(mouse,{x,y,plus_rec_size*7/2,plus_rec_size},render_rec_black) &&
+                                    IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                    {
+                        ChangeEdit(days,header_index,-1,schedule_mode);
+                    }
+                    if(days[*schedule_mode - 1].edit_header == header_index &&
+                            days[*schedule_mode - 1].edit_task == -1)
+                    {
+                        write_text(x,y,plus_rec_size,plus_rec_size*7/2,
+                                days[*schedule_mode - 1].subcat[header_index].header,
+                                days[*schedule_mode - 1].subcat[header_index].header_max_char,
+                                font_info->font_med,font_info->font_size_med,
+                                font_info->font_spacing);
+                        if(IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_ESCAPE))
+                        {
+                            days[*schedule_mode - 1].edit_header = -1;
+                        }
+                        if(IsKeyPressed(KEY_DELETE))
+                        {
+                            RemoveHeader(days[*schedule_mode - 1].subcat,header_index,6);
+                            days[*schedule_mode - 1].edit_header = -1;
+                            days[*schedule_mode - 1].subcat_count -= 1;
+                        }
+                    }
+                    else
+                    {
+                        DrawTextEx(font_info->font_med,days[*schedule_mode - 1].subcat[header_index].header,
+                                    {x+plus_rec_size/8,y+plus_rec_size/4},
+                                font_info->font_size_med,font_info->font_spacing,BLACK);
+                    }
+                    inner_y = y + font_info->font_size_med + font_info->font_size_small*3/2;
+                    for(int j = 0;j < 5;j++)
+                    {
+                        if(days[*schedule_mode - 1].subcat[header_index].task_count == j)
+                        {
+                            if(days[*schedule_mode - 1].edit_header == header_index &&
+                                    days[*schedule_mode - 1].edit_task == j)
+                            {
+                                write_text(inner_x,inner_y,plus_rec_size_inner,plus_rec_size_inner*6,
+                                        days[*schedule_mode - 1].subcat[header_index].
+                                        tasks[j],days[*schedule_mode - 1].subcat[header_index].task_max_char,
+                                        font_info->font_small,font_info->font_size_small,
+                                        font_info->font_spacing);
+                                if(IsKeyPressed(KEY_ENTER))
+                                {
+                                    days[*schedule_mode - 1].subcat[header_index].task_count += 1;
+                                    days[*schedule_mode - 1].edit_header = -1;
+                                    days[*schedule_mode - 1].edit_task = -1;
+                                }
+                                if(IsKeyPressed(KEY_DELETE) || IsKeyPressed(KEY_ESCAPE))
+                                {
+                                    days[*schedule_mode - 1].edit_header = -1;
+                                    days[*schedule_mode - 1].edit_task = -1;
+                                }
+                            }
+                            else 
+                            {
+                                if(render_if_hovered(mouse,
+                                            {inner_x,inner_y,plus_rec_size_inner,plus_rec_size_inner}, render_button) &&
+                                            IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                                {
+                                    days[*schedule_mode - 1].edit_header = header_index;
+                                    days[*schedule_mode - 1].edit_task = j;
+                                }
+                                render_plus({inner_x,inner_y,plus_rec_size_inner,plus_rec_size_inner},SKYBLUE);
+                            }
+                        }
+                        else
+                        {
+                            if(render_if_hovered(mouse,{inner_x-plus_rec_size_inner*7/10,
+                                        inner_y+plus_rec_size_inner/4,plus_rec_size_inner/2,
+                                        plus_rec_size_inner/2},RenderHoveredRec))
+                            {
+                                if(IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                                {
+                                    days[*schedule_mode - 1].subcat[header_index].task_comp ^= (1 << j);
+                                }
+                                /*NOTE: hover while active, add else to below
+                                if(days[*schedule_mode - 1].subcat[header_index].task_comp & (1 << j))
+                                {
+                                    DrawRectangleRec({inner_x-plus_rec_size_inner*7/10,
+                                            inner_y+plus_rec_size_inner/4, plus_rec_size_inner/2, 
+                                            plus_rec_size_inner/2},GREEN);
+                                }
+                                */
+                            }
+                            if(days[*schedule_mode - 1].subcat[header_index].task_comp & (1 << j))
+                            {
+                                //NOTE: potential colour {207,253,188,255}, pale green
+                                DrawRectangleRec({inner_x-plus_rec_size_inner*7/10,inner_y+plus_rec_size_inner/4,
+                                            plus_rec_size_inner/2, plus_rec_size_inner/2},{207,253,188,255});
+                            }
+                            DrawRectangleLinesEx({inner_x-plus_rec_size_inner*7/10,inner_y+plus_rec_size_inner/4,
+                                    plus_rec_size_inner/2,plus_rec_size_inner/2},
+                                    plus_rec_size_inner/16,BLACK);
+                            if(render_if_hovered(mouse,{inner_x,inner_y,plus_rec_size_inner*6,
+                                        plus_rec_size_inner},render_rec_black) && 
+                                    IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                            {
+                                ChangeEdit(days,header_index,j,schedule_mode);
+                            }
+                            if(days[*schedule_mode - 1].edit_header == header_index &&
+                                    days[*schedule_mode - 1].edit_task == j)
+                            {
+                                write_text(inner_x,inner_y,plus_rec_size_inner,plus_rec_size_inner*6,
+                                        days[*schedule_mode - 1].subcat[header_index].tasks[j],
+                                        days[*schedule_mode - 1].subcat[header_index].task_max_char,
+                                        font_info->font_small,font_info->font_size_small,
+                                        font_info->font_spacing);
+                                if(IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_ESCAPE))
+                                {
+                                    days[*schedule_mode - 1].edit_header = -1;
+                                    days[*schedule_mode - 1].edit_task = -1;
+                                }
+                                if(IsKeyPressed(KEY_DELETE))
+                                {
+                                    //NOTE: tasks after the deleted one, shifted right one
+                                    //ex: 0001 1011 --- task two deleted --> 0000 1100
+                                    char new_task_comp = (days[*schedule_mode - 1].subcat[header_index].task_comp
+                                        & (0xFF << (days[*schedule_mode - 1].edit_task + 1))) >> 1;
+                                    //NOTE: clear task completion after and including deleted task
+                                    days[*schedule_mode - 1].subcat[header_index].task_comp &=
+                                        (0xFF >> (8 - days[*schedule_mode - 1].edit_task));
+                                    //NOTE: stitch together new_task_comp with task_comp
+                                    days[*schedule_mode - 1].subcat[header_index].task_comp |= new_task_comp;
+                                    /*
+                                    // NOTE: set bits to show completion, least sig bit is first task, shift left for others
+                                    // ex: 0000 1010 means 2nd and 4th task complete
+                                    char task_comp = 0;
+                                    */
+                                    int k = j;
+                                    for(;k < days[*schedule_mode - 1].subcat[header_index].task_count - 1;++k)
+                                    {
+                                        copy_str(days[*schedule_mode - 1].subcat[header_index].tasks[k+1],
+                                        days[*schedule_mode - 1].subcat[header_index].tasks[k],15);
+                                    }
+                                    clear_str(days[*schedule_mode - 1].subcat[header_index].tasks[k],15);
+                                    days[*schedule_mode - 1].edit_header = -1;
+                                    days[*schedule_mode - 1].edit_task = -1;
+                                    days[*schedule_mode - 1].subcat[header_index].task_count -= 1;
+                                }
+                            }
+                            else
+                            {
+                                DrawTextEx(font_info->font_small,days[*schedule_mode - 1].subcat[header_index].tasks[j],
+                                            {inner_x+plus_rec_size_inner/8,inner_y+plus_rec_size_inner/4},
+                                        font_info->font_size_small,font_info->font_spacing,BLACK);
+                            }
+                        }
+                        if(days[*schedule_mode - 1].subcat[header_index].task_count <= j)
+                        {
+                            break;
+                        }
+                        inner_y += main_box.height/21;
+                    }
+                }
+                y += main_box.height/3;
+                header_index += 1;
+                if(days[*schedule_mode - 1].subcat_count < header_index)
+                {
+                    break;
+                }
+            }
+            if(days[*schedule_mode - 1].subcat_count < header_index)
+            {
+                break;
+            }
+            x += (main_box.width - outer_line_width*4)/2;
+            inner_x += (main_box.width - outer_line_width*4)/2;
+        }
+        for(int i = 0;i < 2;i++)
+        {
+            for(int j = 0;j < 4;j++)
+            {
+                curr_header = headers[curr_index];
+                curr_color = colors[curr_index];
+                header_text_rec = centre_text(font_info->font_small,curr_header,font_info->font_size_small,
+                        font_info->font_spacing,&header_box);
+                DrawTextEx(font_info->font_small,curr_header,{header_text_rec.x,header_text_rec.y},
+                        font_info->font_size_small, font_info->font_spacing,BLACK);
+                //DrawRectangle(header_box.x,header_box.y+font_info->font_size_small+outer_line_width/2,
+                        //header_box.width,outer_line_width/4,BLACK);
+                Vector2 subcat_place = {header_box.x,
+                    header_box.y+font_info->font_size_small+outer_line_width*7/10};
+                for(int k = 0;k < days[curr_index].subcat_count;++k)
+                {
+                    int curr_task_count = 0;
+                    for(int flag_index = 0;flag_index < days[curr_index].subcat[k].task_count;flag_index++)
+                    {
+                        if(!(days[curr_index].subcat[k].task_comp & (1 << flag_index)))
+                        {
+                            curr_task_count += 1;
+                        }
+                    }
+                    if(curr_task_count == 1)
+                    {
+                        char task_str[7] = "1 task";
+                        Vector2 task_width = MeasureTextEx(font_info->font_small,task_str,
+                                font_info->font_size_small,font_info->font_spacing);
+                        DrawTextEx(font_info->font_small,task_str,
+                                    {subcat_place.x+header_box.width-task_width.x,subcat_place.y},
+                                font_info->font_size_small,font_info->font_spacing,{255,166,102,255});
+                    }
+                    else
+                    {
+                        char task_str[8] = "x tasks";
+                        char task_char = 48 + curr_task_count;
+                        task_str[0] = task_char;
+                        Vector2 task_width = MeasureTextEx(font_info->font_small,task_str,
+                                font_info->font_size_small,font_info->font_spacing);
+                        if(task_char == '0')
+                        {
+                            DrawTextEx(font_info->font_small,task_str,
+                                        {subcat_place.x+header_box.width-task_width.x,subcat_place.y},
+                                    font_info->font_size_small,font_info->font_spacing,SKYBLUE);
+                        }
+                        else
+                        {
+                            DrawTextEx(font_info->font_small,task_str,
+                                        {subcat_place.x+header_box.width-task_width.x,subcat_place.y},
+                                    font_info->font_size_small,font_info->font_spacing,{255,166,102,255});
+                        }
+                    }
+                    DrawTextEx(font_info->font_small,days[curr_index].subcat[k].header,
+                                {subcat_place.x,subcat_place.y},
+                            font_info->font_size_small,font_info->font_spacing,BLACK);
+                    subcat_place.y += font_info->font_size_small+outer_line_width/8;
+                }
+                if(day_of_week == curr_index)
+                {
+                    DrawRectangleLinesEx(inner_box,outer_line_width/2,BLACK);
+                }
+                //DrawRectangleLinesEx(inner_box,outer_line_width*2,curr_color);
+                //NOTE: can use this, switch with other header_box render
+                //DrawRectangleLinesEx(header_box,outer_line_width*1,curr_color);
+                if((*schedule_mode - 1) == curr_index)
+                {
+                    DrawRectangleLinesEx(curr_box,curr_box.width/32,BLACK);
+                }
+                if(!hovered)
+                {
+                    hovered = render_if_hovered(mouse,curr_box,render_schedule_box);
+                    if((*schedule_mode - 1) == curr_index && hovered)
+                    {
+                        DrawRectangleLinesEx(curr_box,curr_box.width/32,DARKBLUE);
+                    }
+                    if(hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                    {
+                        ChangeEdit(days,-1,-1,schedule_mode);
+                        if((*schedule_mode - 1) == curr_index)
+                        {
+                            *schedule_mode = 0;
+                        }
+                        else
+                        {
+                            *schedule_mode = curr_index + 1;
+                        }
+                    }
+                }
+
+                curr_box.y += curr_box.height;
+                inner_box.y += curr_box.height;
+                header_box.y += curr_box.height;
+                curr_index += 1;
+            }
+            inner_box.x += curr_box.width*3;
+            inner_box.y -= curr_box.height*4;
+            header_box.x += curr_box.width*3;
+            header_box.y -= curr_box.height*4;
+            curr_box.x += curr_box.width*3;
+            curr_box.y -= curr_box.height*4;
+        }
+    }
+}
+
+void render_button_with_text(FONTS_INFORMATION *font_info,const char* button_text,Color text_col,Rectangle cont_box)
+{
+    Rectangle text_pos = centre_text(font_info->font_med,button_text,
+            font_info->font_size_med,font_info->font_spacing,&cont_box);
+    DrawTextEx(font_info->font_med,button_text,{text_pos.x,text_pos.y},
+            font_info->font_size_med,font_info->font_spacing,LIGHTGRAY);
+}
+
+void render_timer(Rectangle function_section,FONTS_INFORMATION *font_info,TIMER_INFO* timer_info,Vector2 mouse)
+{
+    //NOTE: timer_mode, least sig bit on/off signals timer/stopwatch
+    //second least sig signals looking at tasks vs not
+    //third least sig signals timer started vs not
+    //TODO: one mode for tasks to put time into (used for hour tracker)
+    // one for normal timer (maybe have stopwatch+countdown)
+    //TODO: have option for no task (don't put the time into anything
+    //TODO: option for task post timer?
+    char timer_div[9] = "00:00:00";
+    u64 curr_timer_val = 0;
+    if(timer_info->timer_mode & 0b100)
+    {
+        u64 elapsed_time = (GetTickCount64() - timer_info->timer_start);
+        if(timer_info->timer_mode & 1)
+        {
+            if(timer_info->timer_length < elapsed_time)
+            {
+                curr_timer_val = 0;
+            }
+            else
+            {
+                curr_timer_val = timer_info->timer_length - elapsed_time;
+            }
+        }
+        else
+        {
+            if(timer_info->timer_length + elapsed_time < timer_info->timer_length)
+            {
+                curr_timer_val = 0;
+            }
+            else
+            {
+                curr_timer_val = timer_info->timer_length + elapsed_time;
+            }
+        }
+    }
+    else
+    {
+        curr_timer_val = timer_info->timer_length;
+    }
+    curr_timer_val /= 1000;
+    u16_to_str(curr_timer_val % 60,timer_div,2,6);
+    u16_to_str(curr_timer_val / 60,timer_div,2,3);
+    u16_to_str(curr_timer_val / 3600,timer_div,2,0);
+    char const* curr_task_str = "task placeholder";
+    char const* timer_modes[2] = {"stopwatch","timer"};
+    u8 active_hover = 0;
+    Vector2 timer_size = MeasureTextEx(font_info->font_mega,timer_div,font_info->font_size_mega,font_info->font_spacing);
+    Vector2 timer_placement = {function_section.width/2 - timer_size.x/2,
+        function_section.height/2 - timer_size.y};
+    DrawTextEx(font_info->font_mega,timer_div,timer_placement,
+            font_info->font_size_mega,font_info->font_spacing,BLACK);
+    Rectangle curr_task = {function_section.x + function_section.width/8, function_section.y + 
+        timer_placement.y+timer_size.y,function_section.width*3/8,timer_size.y/2};
+    Rectangle clock_mode = {curr_task.x + curr_task.width,curr_task.y,function_section.width/4,
+        curr_task.height};
+    Rectangle play_button = {clock_mode.x + clock_mode.width,curr_task.y,curr_task.height,curr_task.height};
+    if((timer_info->timer_mode & (1 << 1)) == 0)
+    {
+        if((active_hover = render_if_hovered(mouse,curr_task,render_button)) &&
+                IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+        {
+        }
+        if(v_in_rec(mouse,clock_mode) && !active_hover && !(timer_info->timer_mode & 0b100))
+        {
+            active_hover = 1;
+            if(IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+            {
+                timer_info->timer_mode ^= 1;
+                timer_info->timer_total = timer_info->timer_length;
+            }
+            Rectangle mode_text = centre_text(font_info->font_med,timer_modes[timer_info->timer_mode&1],
+                    font_info->font_size_med,font_info->font_spacing,&clock_mode);
+            DrawTextEx(font_info->font_med,timer_modes[timer_info->timer_mode&1],{mode_text.x,mode_text.y},
+                    font_info->font_size_med,font_info->font_spacing,SKYBLUE);
+        }
+        else
+        {
+            if(timer_info->timer_mode & 0b100)
+            {
+                Rectangle mode_text = centre_text(font_info->font_med,timer_modes[timer_info->timer_mode&1],font_info->font_size_med,
+                        font_info->font_spacing,&clock_mode);
+                DrawTextEx(font_info->font_med,timer_modes[timer_info->timer_mode&1],{mode_text.x,mode_text.y},
+                        font_info->font_size_med,font_info->font_spacing,LIGHTGRAY);
+            }
+            else
+            {
+                Rectangle mode_text = centre_text(font_info->font_med,timer_modes[timer_info->timer_mode&1],font_info->font_size_med,
+                        font_info->font_spacing,&clock_mode);
+                DrawTextEx(font_info->font_med,timer_modes[timer_info->timer_mode&1],{mode_text.x,mode_text.y},
+                        font_info->font_size_med,font_info->font_spacing,BLACK);
+            }
+        }
+        if(v_in_rec(mouse,play_button) && !active_hover)
+        {
+            active_hover = 1;
+            if(IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+            {
+                timer_info->timer_mode ^= 0b100;
+                //TODO: clear button
+                if(timer_info->timer_mode & 0b100)
+                {
+                    if(timer_info->timer_mode & 1)
+                    {
+                        timer_info->timer_start = GetTickCount64();
+                    }
+                    else
+                    {
+                        timer_info->timer_start = GetTickCount64();
+                    }
+                }
+                else
+                {
+                    u64 elapsed_time = GetTickCount64() - timer_info->timer_start;
+                    if(timer_info->timer_mode & 1)
+                    {
+                        if(timer_info->timer_length < elapsed_time)
+                        {
+                            timer_info->timer_length = 0;
+                        }
+                        else
+                        {
+                            timer_info->timer_length -= elapsed_time;
+                        }
+                    }
+                    else
+                    {
+                        if(timer_info->timer_length + elapsed_time < timer_info->timer_length)
+                        {
+                            timer_info->timer_length = 0 - 1;
+                        }
+                        else
+                        {
+                            timer_info->timer_length += elapsed_time;
+                        }
+                    }
+                }
+            }
+            if(timer_info->timer_mode & 0b100)
+            {
+                //void DrawTriangleLines(Vector2 v1, Vector2 v2, Vector2 v3, Color color);
+                DrawRectangleRec({play_button.x+play_button.width*2/10,play_button.y+play_button.height*2/10,
+                        play_button.width*6/10,play_button.height*6/10},SKYBLUE);
+            }
+            else
+            {
+                DrawTriangle({play_button.x+play_button.width*2/10,play_button.y+play_button.height*2/10},
+                        {play_button.x+play_button.width*2/10,play_button.y+play_button.height*8/10},
+                        {play_button.x+play_button.width*8/10,play_button.y+play_button.height/2},
+                        SKYBLUE);
+            }
+        }
+        else
+        {
+            if(timer_info->timer_mode & 0b100)
+            {
+                //void DrawTriangleLines(Vector2 v1, Vector2 v2, Vector2 v3, Color color);
+                DrawRectangleRec({play_button.x+play_button.width*2/10,play_button.y+play_button.height*2/10,
+                        play_button.width*6/10,play_button.height*6/10},BLACK);
+            }
+            else
+            {
+                DrawTriangle({play_button.x+play_button.width*2/10,play_button.y+play_button.height*2/10},
+                        {play_button.x+play_button.width*2/10,play_button.y+play_button.height*8/10},
+                        {play_button.x+play_button.width*8/10,play_button.y+play_button.height/2},
+                        BLACK);
+            }
+        }
+        Rectangle task_button = centre_text(font_info->font_med,curr_task_str,font_info->font_size_med,
+                font_info->font_spacing,&curr_task);
+        DrawTextEx(font_info->font_med,curr_task_str,{task_button.x,task_button.y},
+                font_info->font_size_med,font_info->font_spacing,BLACK);
+        //TODO: add more buttons
+        //Rectangle clock_mode = {curr_task.x + curr_task.width,curr_task.y,function_section.width/4,
+            //curr_task.height};
+        TODO ADD +/- in middle, then right sec min hour. left +1 +5 +10 +30
+        Rectangle add_mode = {clock_mode.x,clock_mode.y+clock_mode.height,clock_mode.width/2,clock_mode.height};
+        const char* add_mode_str[3] = {"sec","min","hour"};
+        DrawRectangleRec(add_mode,BLACK);
+        if(v_in_rec(mouse,add_mode) && !active_hover)
+        {
+            active_hover = 1;
+            render_button_with_text(font_info,add_mode_str[timer_info->timer_mode&1],LIGHTGRAY,add_mode);
+            /*
+            Rectangle mode_text = centre_text(font_info->font_med,add_mode_str[timer_info->add_mode],
+                    font_info->font_size_med,font_info->font_spacing,&add_mode);
+            DrawTextEx(font_info->font_med,timer_modes[timer_info->timer_mode&1],{mode_text.x,mode_text.y},
+                    font_info->font_size_med,font_info->font_spacing,LIGHTGRAY);
+                    */
+        }
+    }
+}
+
+void render_hour_tracker()
+{
+}
+
+void render_flashcards()
+{
+}
+
+void render_settings()
+{
+}
+
+int main() 
+{
+    SYSTEMTIME st, lt;
+
+    //NOTE: autosave every 5 min, once
+    u8 auto_save_ready = 0;
+    u8 message_alpha = 0;
+    u8 message_index = 0;
+    int message_timer_length = 200;
+    int message_timer = message_timer_length;
+    char const *messages[7] = {"Autosaved successfully","Synced successfully","Autosave failed (save)",
+        "Autosave failed (close)","Sync failed (save)", "Sync failed (close)", "Sync failed (sync)"};
+
+    //NOTE(anton): debug vars
+    int debug_rec_line_width = 3;
+
+    // TODO(anton): make init based on file
+    // of setting of last session, if exists
+    // Also, change size in loop?
+    Vector2 window_size = {1280,720};
+    InitWindow(window_size.x, window_size.y, "Schedule");
+    SetExitKey(KEY_NULL);
+    SetTargetFPS(60);
+    // TODO(anton): how do I give fonts?
+    // Font choice? Other languages?
+    // TODO: codepoints for other langs
+    // TODO(anton): tune sizes
+    const char * font_name = "Aldrich-Regular.ttf";
+    int base_font_size = window_size.x/16;
+    int font_size_mega = base_font_size*2;
+    int font_size_large = base_font_size;
+    int font_size_med = base_font_size/2;
+    int font_size_small = base_font_size/4;
+    // TODO(anton): load different font sizes for different text?
+    Font font_mega = LoadFontEx(font_name,font_size_mega,0,0);
+    Font font_large = LoadFontEx(font_name,font_size_large,0,0);
+    Font font_med = LoadFontEx(font_name,font_size_med,0,0);
+    Font font_small = LoadFontEx(font_name,font_size_small,0,0);
+
+    FONTS_INFORMATION font_info = {font_mega,font_large, font_med, font_small,
+                        font_size_mega,font_size_large, font_size_med, font_size_small};
+
+    TIMER_INFO timer_info;
+
+    // NOTE(anton): for clock in top right
+    char time_char[6];
+    time_char[2] = ':';
+    time_char[5] = 0;
+
+    // NOTE(anton): for date in top-right
+    char date_char[11];
+    date_char[2] = '.';
+    date_char[5] = '.';
+    date_char[10] = 0;
+
+    // NOTE(anton): Rectangle: x, y, width, height
+    // NOTE(anton): division line between nav/main canvas
+    Rectangle div_line = {window_size.x*3/4,0,window_size.x/800,window_size.y};
+
+    // NOTE(anton): useful for later, section for time/date/notif
+    Rectangle time_section = {window_size.x*3/4,0,window_size.x/4,window_size.y/4};
+
+    Rectangle button_section = {window_size.x*3/4,window_size.y/4,window_size.x/4,window_size.y*3/4};
+
+    Rectangle function_section = {0,0,(window_size.x*3)/4,window_size.y};
+
+    // NOTE(anton): button init
+    SIDE_BAR_BUTTONS side_bar_buttons;
+    strncpy(side_bar_buttons.schedule.str, "schedule", 25);
+    strncpy(side_bar_buttons.timer.str, "timer", 25);
+    strncpy(side_bar_buttons.hour_tracker.str, "hour tracker", 25);
+    strncpy(side_bar_buttons.flashcards.str, "flashcards", 25);
+
+    // TODO(anton): click on time for clock, or maybe set alarm?
+    SIDE_BAR_TIME side_bar_time;
+
+    int debug_text_size;
+    
+    bool8 notification = 0;
+
+    Vector2 mouse = {};
+
+    //NOTE: schedule = 1, timer = 2, hour_tracker = 3, flash_cards = 4, sync = 5, settings = 6
+    int curr_mode = 0;
+
+    int schedule_mode = 0;
+
+    // TODO: schedule_day init from file
+    schedule_day days[8];
+
+    {
+        FILE *fp = fopen("schedule_days.txt","r");
+        if(fp != 0)
+        {
+            fread(days,sizeof(schedule_day),8,fp);
+        }
+        fclose(fp);
+    }
+
+    while(!WindowShouldClose()) 
+    {
+        GetLocalTime(&lt);
+
+        //TODO: autosave
+        if(lt.minute % 5 == 0 && auto_save_ready)
+        {
+            auto_save_ready = 0;
+            message_alpha = 0;
+            message_timer = 0;
+            message_index = 2;
+            //NOTE: not need curr_mode?
+            //curr_mode = 5;
+            FILE *fp = fopen("schedule_days.txt","w");
+
+            if(fp != 0)
+            {
+                fwrite(days,sizeof(schedule_day),8,fp);
+                if(fclose(fp) == 0)
+                {
+                    //NOTE: closed successfully
+                    message_index = 0;
+                    //TODO: add sync logic
+                }
+                else
+                {
+                    message_index = 3;
+                }
+            }
+        }
+        else if(lt.minute % 5 == 4)
+        {
+            auto_save_ready = 1;
+        }
+
+        // NOTE(anton): get time
+        u16_to_str(lt.hour,time_char,2,0);
+        u16_to_str(lt.minute,time_char,2,3);
+
+        // NOTE(anton): get date
+        u16_to_str(lt.day,date_char,2,0);
+        u16_to_str(lt.month,date_char,2,3);
+        u16_to_str(lt.year,date_char,4,6);
+
+        // NOTE(anton): calc sizes
+        time_section = {window_size.x*3/4,0,window_size.x/4,window_size.y/4};
+        update_time_section(&side_bar_time, time_section, &font_info, time_char, date_char);
+
+        button_section = {window_size.x*3/4,window_size.y/4,window_size.x/4,window_size.y*3/4};
+        update_button_section(&side_bar_buttons, button_section, &font_info);
+
+        mouse = GetMousePosition();
+
+        BeginDrawing();
+        // NOTE(anton): draw buttons if hovered
+        if(render_if_hovered(mouse,side_bar_buttons.schedule.button,render_button)
+                && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+        {
+            curr_mode = 1;
+        }
+        if(render_if_hovered(mouse,side_bar_buttons.timer.button,render_button)
+                && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+        {
+            curr_mode = 2;
+        }
+        if(render_if_hovered(mouse,side_bar_buttons.hour_tracker.button,render_button)
+                && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+        {
+            curr_mode = 3;
+        }
+        if(render_if_hovered(mouse,side_bar_buttons.flashcards.button,render_button)
+                && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+        {
+            curr_mode = 4;
+        }
+        if(render_if_hovered(mouse,side_bar_buttons.sync,render_button)
+                && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && message_timer == message_timer_length)
+        {
+            message_alpha = 0;
+            message_timer = 0;
+            message_index = 4;
+            //NOTE: not need curr_mode?
+            //curr_mode = 5;
+            FILE *fp = fopen("schedule_days.txt","w");
+
+            if(fp != 0)
+            {
+                fwrite(days,sizeof(schedule_day),8,fp);
+                if(fclose(fp) == 0)
+                {
+                    //NOTE: closed successfully
+                    message_index = 1;
+                    //TODO: add sync logic
+                }
+                else
+                {
+                    message_index = 5;
+                }
+            }
+        }
+        if(render_if_hovered(mouse,side_bar_buttons.settings,render_button)
+                && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+        {
+            curr_mode = 6;
+        }
+
+        if(message_timer < message_timer_length)
+        {
+            if(message_timer < 51)
+            {
+                message_alpha += 5;
+            }
+            else if(message_timer >= message_timer_length - 51)
+            {
+                message_alpha -= 5;
+            }
+            //char const *messages[5] = {"Autosaved successfully","Synced successfully","Autosave failed",
+                //"Sync failed (save)", "Sync failed (close)", "Sync failed (sync)"};
+            DrawTextEx(font_info.font_small,messages[message_index],{time_section.x+font_info.font_size_small,
+                    time_section.y+time_section.height-font_info.font_size_small},font_info.font_size_small,
+                    font_info.font_spacing,{0,0,0,message_alpha});
+            message_timer++;
+        }
+
+        // TODO(anton): change font size in app, calc spacing
+        // TODO(anton): need to reload font when resizing
+        // NOTE(anton): draw time
+        DrawTextEx(font_info.font_large,time_char, {side_bar_time.time.x,side_bar_time.time.y},
+                font_info.font_size_large, font_info.font_spacing, Color{0,0,0,255});
+        // NOTE(anton): draw date
+        DrawTextEx(font_info.font_small,date_char, {side_bar_time.date.x,side_bar_time.date.y},
+                font_info.font_size_small, font_info.font_spacing, Color{0,0,0,255});
+        /*
+        struct schedule_subcat
+        {
+            // NOTE: task max str len ~14?
+            int header_max_char = 8;
+            int task_max_char = 20;
+            u8 task_count = 0;
+            // NOTE: header max str len ~8?
+            char header[9] = {0};
+            // NOTE: max 5 tasks
+            char tasks[5][21] = {0};
+            // NOTE: set bits to show completion, least sig bit is first task, shift left for others
+            // ex: 0000 1010 means 2nd and 4th task complete
+            char task_comp = 0;
+        };
+        */
+        notification = 0;
+        for(int subcat_ind = 0;subcat_ind < days[(lt.day_of_week+6)%7].subcat_count;subcat_ind++)
+        {
+            u8 comp_tasks = 0;
+            for(int i = 0;i < days[(lt.day_of_week+6)%7].subcat[subcat_ind].task_count;i++)
+            {
+                if(days[(lt.day_of_week+6)%7].subcat[subcat_ind].task_comp & (1 << i))
+                {
+                    comp_tasks++;
+                }
+            }
+            if(comp_tasks < days[(lt.day_of_week+6)%7].subcat[subcat_ind].task_count)
+            {
+                notification = 1;
+                break;
+            }
+        }
+        // NOTE(anton): draw notifications
+        if(notification)
+        {
+            if(render_if_hovered(mouse,side_bar_time.notifications,render_button)
+                    && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+            {
+                curr_mode = 1;
+                schedule_mode = lt.day_of_week;
+            }
+            DrawTextEx(font_info.font_small," ! ", {side_bar_time.notifications.x,side_bar_time.notifications.y+
+                    font_info.font_size_small/8},
+                    font_info.font_size_small, font_info.font_spacing, RED);
+        }
+        // NOTE(anton): draw button text
+        DrawTextEx(font_info.font_med,side_bar_buttons.schedule.str,
+                {side_bar_buttons.schedule.str_rec.x,side_bar_buttons.schedule.str_rec.y},
+                font_info.font_size_med, font_info.font_spacing, BLACK);
+        DrawTextEx(font_info.font_med,side_bar_buttons.timer.str,
+                {side_bar_buttons.timer.str_rec.x,side_bar_buttons.timer.str_rec.y},
+                font_info.font_size_med, font_info.font_spacing, BLACK);
+        DrawTextEx(font_info.font_med,side_bar_buttons.hour_tracker.str,
+                {side_bar_buttons.hour_tracker.str_rec.x,side_bar_buttons.hour_tracker.str_rec.y},
+                font_info.font_size_med, font_info.font_spacing, BLACK);
+        DrawTextEx(font_info.font_med,side_bar_buttons.flashcards.str,
+                {side_bar_buttons.flashcards.str_rec.x,side_bar_buttons.flashcards.str_rec.y},
+                font_info.font_size_med, font_info.font_spacing, BLACK);
+        DrawTextEx(font_info.font_med,side_bar_buttons.sync_str,
+                {side_bar_buttons.sync_rec.x,side_bar_buttons.sync_rec.y},
+                font_info.font_size_med, font_info.font_spacing, BLACK);
+        DrawTextEx(font_info.font_med,"O",
+                {side_bar_buttons.settings_str_rec.x,side_bar_buttons.settings_str_rec.y},
+                font_info.font_size_med, font_info.font_spacing, BLACK);
+
+
+        //NOTE: draw current function
+        if(curr_mode == 1)
+        {
+            render_schedule(function_section,&font_info,mouse,&schedule_mode,lt.day_of_week,days);
+        }
+        else if(curr_mode == 2)
+        {
+            render_timer(function_section,&font_info,&timer_info,mouse);
+        }
+#if SCHEDULE_DEBUG_RECTANGLES
+        DrawRectangle(window_size.x*3/4,0,window_size.x/4,window_size.y/4,Color{ 211, 176, 131, 255 });
+        DrawRectangleLinesEx(side_bar_time.time, debug_rec_line_width, RED);
+        DrawRectangleLinesEx(side_bar_time.date, debug_rec_line_width, RED);
+        DrawRectangleLinesEx(side_bar_time.notifications, debug_rec_line_width, RED);
+        DrawRectangleRec(div_line,BLACK);
+        DrawRectangleLinesEx(side_bar_buttons.schedule.button, debug_rec_line_width, RED);
+        DrawRectangleLinesEx(side_bar_buttons.timer.button, debug_rec_line_width, RED);
+        DrawRectangleLinesEx(side_bar_buttons.hour_tracker.button, debug_rec_line_width, RED);
+        DrawRectangleLinesEx(side_bar_buttons.flashcards.button, debug_rec_line_width, RED);
+        DrawRectangleLinesEx(side_bar_buttons.sync, debug_rec_line_width, RED);
+        DrawRectangleLinesEx(side_bar_buttons.settings, debug_rec_line_width, RED);
+#endif
+        // TODO(anton): draw darker, maybe based on time?
+        ClearBackground(Color{255,255,255,255});
+        EndDrawing();
+    }
+    FILE *fp = fopen("schedule_days.txt","w");
+
+    if(fp != 0)
+    {
+        fwrite(days,sizeof(schedule_day),8,fp);
+        fclose(fp);
+    }
+    CloseWindow();
+}
